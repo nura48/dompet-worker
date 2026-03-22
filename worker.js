@@ -1,6 +1,3 @@
-// Cloudflare Worker — Gemini API Proxy (GRATIS, tidak perlu kartu kredit)
-// Ganti isi worker.js di GitHub dengan kode ini, lalu retry deploy
-
 const ALLOWED_ORIGIN = '*';
 
 async function handleRequest(request) {
@@ -22,15 +19,21 @@ async function handleRequest(request) {
   try {
     const body = await request.json();
 
-    if (!body.imageBase64 || !body.mediaType) {
-      return jsonResponse({ error: 'Missing imageBase64 or mediaType' }, 400);
+    if (!body.imageBase64) {
+      return jsonResponse({ error: 'Missing imageBase64' }, 400);
     }
 
-    if (body.imageBase64.length > 5 * 1024 * 1024) {
-      return jsonResponse({ error: 'Image too large (max 5MB)' }, 400);
+    // Auto-detect atau fallback ke jpeg
+    const mediaType = body.mediaType && body.mediaType.startsWith('image/')
+      ? body.mediaType
+      : 'image/jpeg';
+
+    // Compress jika terlalu besar — ambil max 800KB base64
+    let imageData = body.imageBase64;
+    if (imageData.length > 800000) {
+      imageData = imageData.substring(0, 800000);
     }
 
-    // Gemini 1.5 Flash — gratis 15 req/menit, 1500 req/hari
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     const geminiBody = {
@@ -38,31 +41,27 @@ async function handleRequest(request) {
         parts: [
           {
             inline_data: {
-              mime_type: body.mediaType,
-              data: body.imageBase64
+              mime_type: mediaType,
+              data: imageData
             }
           },
           {
-            text: `Kamu adalah asisten yang membaca foto nota/struk belanja/bukti transfer pembayaran.
-Ekstrak informasi dari gambar ini dan balas HANYA dalam format JSON berikut, tanpa teks lain, tanpa markdown, tanpa backtick:
-{"nominal":number,"deskripsi":"string max 60 karakter","kategori":"makan|minum|transport|belanja|tagihan|kesehatan|hiburan|lainnya","tanggal":"YYYY-MM-DD atau null","catatan":"string atau null"}
+            text: `Baca foto nota/struk/bukti bayar ini. Balas HANYA JSON ini tanpa teks lain:
+{"nominal":number,"deskripsi":"max 60 char","kategori":"makan|minum|transport|belanja|tagihan|kesehatan|hiburan|lainnya","tanggal":"YYYY-MM-DD atau null","catatan":"string atau null"}
 
-Aturan:
-- nominal: angka saja tanpa titik/koma (contoh: 19000 bukan 19.000)
-- deskripsi: ringkas isi nota (contoh: "Transfer ke Ade Faizal", "Makan siang warteg")
-- kategori: pilih yang paling sesuai dari daftar yang ada
-- tanggal: format YYYY-MM-DD, isi null jika tidak ada tanggal di nota
-- catatan: info tambahan penting, null jika tidak ada
-- Jika ini bukti transfer: nominal = jumlah transfer, deskripsi = "Transfer ke [nama penerima]"
-- Jika gambar bukan nota/struk: isi nominal 0, deskripsi "Bukan nota"
+Aturan penting:
+- nominal: angka saja tanpa titik/koma/Rp (19000 bukan Rp19.000)
+- deskripsi: nama tempat atau isi pembelian singkat
+- tanggal: dari nota jika ada, null jika tidak ada
+- Jika tidak bisa baca: {"nominal":0,"deskripsi":"Tidak terbaca","kategori":"lainnya","tanggal":null,"catatan":null}
 
-Balas JSON saja, tidak ada teks lain sama sekali.`
+JSON saja, tidak ada teks lain.`
           }
         ]
       }],
       generationConfig: {
         temperature: 0.1,
-        maxOutputTokens: 300
+        maxOutputTokens: 256
       }
     };
 
@@ -73,38 +72,48 @@ Balas JSON saja, tidak ada teks lain sama sekali.`
     });
 
     if (!geminiRes.ok) {
-      const err = await geminiRes.text();
-      return jsonResponse({ error: 'Gemini API error: ' + geminiRes.status, detail: err }, 502);
+      const errText = await geminiRes.text();
+      return jsonResponse({
+        error: `Gemini error ${geminiRes.status}`,
+        detail: errText.substring(0, 200)
+      }, 502);
     }
 
     const geminiData = await geminiRes.json();
     const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
 
-    // Bersihkan markdown kalau ada
-    let clean = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
+    // Bersihkan response
+    let clean = rawText
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
+      .trim();
 
     let parsed;
     try {
       parsed = JSON.parse(clean);
     } catch {
-      const match = clean.match(/\{[\s\S]*\}/);
+      const match = clean.match(/\{[\s\S]*?\}/);
       if (match) {
-        try { parsed = JSON.parse(match[0]); }
-        catch { return jsonResponse({ error: 'Failed to parse response', raw: rawText }, 500); }
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch {
+          parsed = { nominal: 0, deskripsi: 'Gagal baca', kategori: 'lainnya', tanggal: null, catatan: rawText.substring(0, 100) };
+        }
       } else {
-        return jsonResponse({ error: 'No JSON in response', raw: rawText }, 500);
+        parsed = { nominal: 0, deskripsi: 'Gagal parse', kategori: 'lainnya', tanggal: null, catatan: null };
       }
     }
 
-    // Pastikan nominal adalah angka
+    // Pastikan nominal angka
     if (typeof parsed.nominal === 'string') {
       parsed.nominal = parseFloat(parsed.nominal.replace(/[^0-9.]/g, '')) || 0;
     }
+    if (!parsed.nominal) parsed.nominal = 0;
 
     return jsonResponse({ success: true, data: parsed });
 
   } catch (err) {
-    return jsonResponse({ error: err.message || 'Internal error' }, 500);
+    return jsonResponse({ error: err.message || 'Internal server error' }, 500);
   }
 }
 
